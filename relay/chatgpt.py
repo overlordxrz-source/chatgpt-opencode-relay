@@ -81,7 +81,7 @@ class ChatGPTAdapter:
         created first - not necessarily the one on screen. Reading that made the
         relay believe the watched conversation was gone and go idle.
         """
-        visible = self.app.visible_window_title()
+        visible = self.app.ax_window_title()
         if visible:
             return visible
         if self._tree is not None:
@@ -238,7 +238,7 @@ class ChatGPTAdapter:
         windows = tree.find_all(role="AXWindow")
         if not windows:
             return None
-        visible = self.app.visible_window_title()
+        visible = self.app.ax_window_title()
         if visible:
             for window in windows:
                 if window.title == visible:
@@ -383,8 +383,11 @@ class ChatGPTAdapter:
             return False
 
         tree = self.app.tree()
-        window = self.window_node(tree)
-        scope = window if window is not None else tree
+        # Press the send control of the *composer's own* window: the app can
+        # hold several windows, and pressing the send button of another one
+        # types nothing and submits nothing.
+        owner = _owning_window(composer)
+        scope = owner if owner is not None else tree
         send_button = scope.find(role="AXButton", exact_text="Send")
         if send_button is not None:
             self.app.press(send_button)
@@ -398,6 +401,16 @@ class ChatGPTAdapter:
             return True
         self.log("chatgpt: the message did not appear in the conversation")
         return False
+
+
+def _owning_window(node: Node) -> Optional[Node]:
+    """The AXWindow a node belongs to."""
+    current = node
+    while current is not None:
+        if current.role == "AXWindow":
+            return current
+        current = current.parent
+    return None
 
 
 def _pick_composer(scope: Node) -> Optional[Node]:
@@ -416,10 +429,9 @@ def _pick_composer(scope: Node) -> Optional[Node]:
     for area in areas:
         if area.value.strip().startswith(("Ask ChatGPT", "Message ChatGPT")):
             return area
-    for area in areas:
-        if area.description.strip() == "Start writing":
-            return area
-    return areas[-1]
+    # A field labelled "Start writing" is a per-message *edit* box, never the
+    # composer - typing into it does nothing useful.
+    return None
 
 
 def _find_by_description(node: Node, description: str) -> Optional[Node]:

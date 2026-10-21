@@ -82,6 +82,7 @@ class Node:
     position: Optional[tuple[float, float]] = None
     size: Optional[tuple[float, float]] = None
     children: list["Node"] = field(default_factory=list)
+    parent: Optional["Node"] = None
 
     @property
     def text(self) -> str:
@@ -134,7 +135,9 @@ def _snapshot(element, depth: int, max_depth: int, budget: list[int]) -> Node:
         return node
     raw_children = _attr(element, "AXChildren", []) or []
     for child in list(raw_children)[:400]:
-        node.children.append(_snapshot(child, depth + 1, max_depth, budget))
+        snapshot = _snapshot(child, depth + 1, max_depth, budget)
+        snapshot.parent = node
+        node.children.append(snapshot)
     return node
 
 
@@ -237,6 +240,23 @@ class ChatGPTApp:
             return True
         except Exception:
             return False
+
+    def ax_window_title(self) -> str:
+        """Title of the window the accessibility tree is describing.
+
+        The app can keep several windows (one per conversation) open, and the
+        window server may report a different one from the one in front. The
+        accessibility tree is what the relay actually reads, so it is the
+        authority for "which conversation am I looking at".
+        """
+        app = self._resolve()
+        for attribute in ("AXFocusedWindow", "AXMainWindow"):
+            err, value = AXUIElementCopyAttributeValue(app, attribute, None)
+            if err == 0 and value is not None:
+                err2, title = AXUIElementCopyAttributeValue(value, "AXTitle", None)
+                if err2 == 0 and title:
+                    return str(title)
+        return ""
 
     def visible_window_title(self) -> str:
         """Title of the frontmost on-screen window of this app."""
