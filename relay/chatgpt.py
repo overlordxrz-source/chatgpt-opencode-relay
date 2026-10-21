@@ -389,23 +389,20 @@ class ChatGPTAdapter:
         owner = _owning_window(composer)
         scope = owner if owner is not None else tree
         send_button = scope.find(role="AXButton", exact_text="Send")
-        if send_button is not None:
-            self.app.press(send_button)
-        else:
-            self.app.press_return()
-        time.sleep(0.8)
-
-        # Post-condition: the message must actually be in the conversation we
-        # are watching, otherwise the reply would land in another chat.
-        if self._reply_landed(text):
-            return True
-        # The button press can be swallowed (stale element, focus lost): try
-        # the keyboard path before giving up.
-        self.log("chatgpt: send button did not submit, trying Return")
+        # The keyboard is the reliable path: the app's own send control is an
+        # icon that the accessibility press does not always activate.
         self.app.press_return()
-        time.sleep(0.8)
+        time.sleep(0.9)
         if self._reply_landed(text):
             return True
+
+        if send_button is not None:
+            self.log("chatgpt: Return did not submit, pressing the send control")
+            self.app.press(send_button)
+            time.sleep(0.9)
+            if self._reply_landed(text):
+                return True
+
         self.log("chatgpt: the message did not appear in the conversation")
         return False
 
