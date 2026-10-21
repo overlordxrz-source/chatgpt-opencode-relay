@@ -278,3 +278,66 @@ def _wait_for(controller, timeout: float = 10.0):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class SplitReplyTests(unittest.TestCase):
+    """A turn can arrive as several assistant messages (segments)."""
+
+    def test_segments_are_joined_into_one_reply(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake = FakeOpenCode(backlog=[], polls_before_reply=1)
+            chatgpt = FakeChatGPT()
+            controller = make_controller(fake, chatgpt, tmpdir)
+
+            # The agent answers in two segments, as the TUI records them.
+            original_send = fake.send
+
+            def send_with_segments(bridge_session_id, text, wait=False, timeout_ms=120000):
+                result = original_send(bridge_session_id, text, wait=wait, timeout_ms=timeout_ms)
+                prompt_id = result["accepted"]["id"]
+                created = result["accepted"]["time"]["created"]
+                for index, part in enumerate(("first half. ", "second half.")):
+                    fake.transcript.append(
+                        {
+                            "id": f"{prompt_id}_seg{index}",
+                            "role": "assistant",
+                            "text": part,
+                            "createdAt": created + index + 1,
+                        }
+                    )
+                fake.pending.pop(0)  # already answered
+                return result
+
+            fake.send = send_with_segments
+            controller.handle_command(_command("give me a two part answer"))
+            _wait_for(controller)
+
+            exchanges = controller.store.recent_exchanges(1)
+            response = str(exchanges[0]["response"])
+            self.assertIn("first half.", response, f"{MARKER}: first segment lost")
+            self.assertIn("second half.", response, f"{MARKER}: second segment lost")
+
+    def test_interrupted_exchange_can_be_retried(self):
+        """A request interrupted by a restart must be deliverable again."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake = FakeOpenCode(backlog=[], polls_before_reply=1)
+            chatgpt = FakeChatGPT()
+            controller = make_controller(fake, chatgpt, tmpdir)
+
+            # Simulate a crash: a reservation that was never finished.
+            controller.store.reserve_exchange("ses_fake", "a request that was in flight")
+            self.assertEqual(
+                1,
+                controller.store.recent_exchange_with_request(
+                    "a request that was in flight", 300
+                ),
+            )
+            released = controller.store.release_stale_exchanges()
+            self.assertEqual(1, released)
+            self.assertEqual(
+                0,
+                controller.store.recent_exchange_with_request(
+                    "a request that was in flight", 300
+                ),
+                f"{MARKER}: an interrupted request still blocks a retry",
+            )

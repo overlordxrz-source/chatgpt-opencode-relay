@@ -168,6 +168,16 @@ class ChatGPTAdapter:
         self.log(f"chatgpt: window title is {self._window_title()!r} after opening {self.conversation!r}")
         return False
 
+    def _reply_landed(self, text: str, attempts: int = 3) -> bool:
+        """Check that a posted message really is in the watched conversation."""
+        needle = " ".join(text.split())[:40]
+        for _ in range(attempts):
+            for message in self.read_messages():
+                if needle and needle in " ".join(message.text.split()):
+                    return True
+            time.sleep(0.6)
+        return False
+
     def rename_conversation(self, new_title: str) -> bool:
         """Rename the open conversation through the app's own menu."""
         tree = self.app.tree()
@@ -299,9 +309,13 @@ class ChatGPTAdapter:
         rather than by fixed coordinates.
         """
         tree = self.app.tree()
-        composer = tree.find(role="AXTextArea")
+        # Scope to the visible window: the app keeps other windows alive, and
+        # the first AXTextArea in the tree can belong to a different chat.
+        window = self.window_node(tree)
+        scope = window if window is not None else tree
+        composer = _pick_composer(scope)
         if composer is None:
-            self.log("chatgpt: no AXTextArea (composer) in the tree")
+            self.log("chatgpt: no composer text area in the visible window")
             return None
 
         self.app.press(composer)
@@ -369,13 +383,43 @@ class ChatGPTAdapter:
             return False
 
         tree = self.app.tree()
-        send_button = tree.find(role="AXButton", exact_text="Send")
+        window = self.window_node(tree)
+        scope = window if window is not None else tree
+        send_button = scope.find(role="AXButton", exact_text="Send")
         if send_button is not None:
             self.app.press(send_button)
         else:
             self.app.press_return()
         time.sleep(0.8)
-        return True
+
+        # Post-condition: the message must actually be in the conversation we
+        # are watching, otherwise the reply would land in another chat.
+        if self._reply_landed(text):
+            return True
+        self.log("chatgpt: the message did not appear in the conversation")
+        return False
+
+
+def _pick_composer(scope: Node) -> Optional[Node]:
+    """The real message composer.
+
+    The window can hold several text areas (the composer, a draft field, a
+    search box). Typing into the wrong one silently does nothing, so the
+    composer is identified by its own label.
+    """
+    areas = scope.find_all(role="AXTextArea")
+    if not areas:
+        return None
+    for area in areas:
+        if area.description.strip() in ("Ask ChatGPT", "Message ChatGPT", "Send a message"):
+            return area
+    for area in areas:
+        if area.value.strip().startswith(("Ask ChatGPT", "Message ChatGPT")):
+            return area
+    for area in areas:
+        if area.description.strip() == "Start writing":
+            return area
+    return areas[-1]
 
 
 def _find_by_description(node: Node, description: str) -> Optional[Node]:

@@ -290,6 +290,40 @@ class ChatGPTApp:
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, script)
         time.sleep(0.02)
 
+    def paste_text(self, text: str) -> bool:
+        """Paste text into the focused element using real key events.
+
+        Setting an accessibility value on a React-controlled editor does not
+        fire the input events the app listens to, so the app never sees the
+        text and refuses to submit it. A real paste does.
+        """
+        try:
+            from AppKit import NSPasteboard, NSStringPboardType
+
+            pasteboard = NSPasteboard.generalPasteboard()
+            pasteboard.clearContents()
+            pasteboard.setString_forType_(text, NSStringPboardType)
+        except Exception:
+            return False
+        self.keystroke(9, command=True)  # cmd+v
+        time.sleep(0.25)
+        return True
+
+    def clear_focused(self) -> None:
+        """Select all and delete, so a leftover draft does not get appended."""
+        self.keystroke(0, command=True)   # cmd+a
+        time.sleep(0.05)
+        self.keystroke(51)               # delete/backspace
+        time.sleep(0.15)
+
+    def keystroke(self, keycode: int, command: bool = False) -> None:
+        flags = Quartz.kCGEventFlagMaskCommand if command else 0
+        for down in (True, False):
+            event = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
+            Quartz.CGEventSetFlags(event, flags)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            time.sleep(0.02)
+
     def press_return(self) -> None:
         """Press the Return key."""
         for down in (True, False):

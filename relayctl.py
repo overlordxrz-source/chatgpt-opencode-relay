@@ -126,6 +126,12 @@ def cmd_run(args) -> int:
     pause_file = status_path.parent / PAUSE_FILE_NAME
 
     relay_config, chatgpt, opencode, store, controller = _build(data)
+    released = store.release_stale_exchanges()
+    if released:
+        log(f"relay: released {released} exchange(s) interrupted by a restart")
+    abandoned = store.abandon_stale_reservations()
+    if abandoned:
+        log(f"relay: marked {abandoned} exchange(s) abandoned after a restart")
     if not relay_config.conversation:
         log("relay: no chatgpt.conversation configured - run 'relayctl new-test-chat' or edit the config")
         return 2
@@ -506,6 +512,9 @@ def cmd_selftest(args) -> int:
     """Checkpoint A/B: read a message, send a message, exercise OpenCode."""
     data = config_mod.load_config()
     relay_config, chatgpt, opencode, store, controller = _build(data)
+    released = store.release_stale_exchanges()
+    if released:
+        log(f"relay: released {released} exchange(s) interrupted by a restart")
     failures = 0
 
     print("== checkpoint A: chatgpt read ==")

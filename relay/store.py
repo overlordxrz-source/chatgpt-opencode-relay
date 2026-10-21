@@ -178,6 +178,20 @@ class Store:
             )
             self._db.commit()
 
+    def release_stale_exchanges(self) -> int:
+        """Mark exchanges left 'started' by a crash as interrupted.
+
+        Without this a request that was in flight when the relay died could
+        never be delivered again - the idempotency guard would see it as
+        already handled.
+        """
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE exchanges SET status='interrupted' WHERE status='started'"
+            )
+            self._db.commit()
+            return int(cursor.rowcount or 0)
+
     def reserve_exchange(self, session: str, request: str) -> int:
         """Claim a request before the worker starts, so a concurrent duplicate
         of the same request is refused instead of being delivered twice."""
@@ -200,6 +214,21 @@ class Store:
             )
             self._db.commit()
 
+    def abandon_stale_reservations(self, older_than: float = 900.0) -> int:
+        """Mark reservations left behind by a restart as abandoned.
+
+        A relay restart kills in-flight workers; their 'started' rows would
+        otherwise look like permanently stuck exchanges.
+        """
+        cutoff = time.time() - older_than
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE exchanges SET status='abandoned' WHERE status='started' AND started_at < ?",
+                (cutoff,),
+            )
+            self._db.commit()
+        return int(cursor.rowcount or 0)
+
     def count_since(self, seconds: float, executed_only: bool = True) -> int:
         """Count exchanges in a time window.
 
@@ -211,7 +240,7 @@ class Store:
             if executed_only:
                 row = self._db.execute(
                     "SELECT COUNT(*) AS n FROM exchanges WHERE started_at >= ? "
-                    "AND status NOT IN ('refused', 'error', 'started')",
+                    "AND status NOT IN ('refused', 'error', 'started', 'interrupted')",
                     (cutoff,),
                 ).fetchone()
             else:

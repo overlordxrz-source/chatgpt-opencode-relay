@@ -126,6 +126,10 @@ class RelayController:
         self._state: dict[str, dict] = {}
         self.active_conversation: str = ""
         self._workers: list[threading.Thread] = []
+        # Assistant message ids already claimed by a worker, so two concurrent
+        # workers can never answer the same request with the same message.
+        self._claimed: set[str] = set()
+        self._claim_lock = threading.Lock()
         self._last_visit: dict[str, float] = {}
         self._pending_text: Optional[str] = None
         self._pending_hits = 0
@@ -575,6 +579,7 @@ class RelayController:
         if not request_created_at:
             request_created_at = time.time() * 1000
         candidate: Optional[str] = None
+        candidate_id: Optional[str] = None
         stable_hits = 0
         while time.time() < deadline:
             try:
@@ -594,23 +599,32 @@ class RelayController:
                     for m in messages
                     if float(m.get("createdAt") or 0) >= request_created_at
                 ]
-                answers = [
-                    m.get("text", "")
-                    for m in fresh
-                    if m.get("role") == "assistant" and m.get("text")
-                ]
-                try:
-                    state = self.opencode.status(bridge_session_id).get("status", {})
-                    running = bool(state.get("running"))
-                except Exception:
-                    running = True
-                if answers and not running:
-                    if answers[0] == candidate:
+                with self._claim_lock:
+                    claimed = set(self._claimed)
+                # The agent's answer can arrive as *several* assistant messages
+                # (one turn is split into segments), so the reply is the whole
+                # trailing run of assistant messages, not just the first.
+                run: list[dict] = []
+                for message in reversed(fresh):
+                    if message.get("role") != "assistant" or not message.get("text"):
+                        break
+                    if str(message.get("id")) in claimed:
+                        break
+                    run.append(message)
+                run.reverse()
+                if run:
+                    text = "\n\n".join(m.get("text", "") for m in run).strip()
+                    ids = [str(m.get("id")) for m in run]
+                    signature = "|".join(ids)
+                    if text == candidate and signature == candidate_id:
                         stable_hits += 1
                     else:
-                        candidate = answers[0]
+                        candidate = text
+                        candidate_id = signature
                         stable_hits = 1
-                    if stable_hits >= 2:
+                    if stable_hits >= 3:
+                        with self._claim_lock:
+                            self._claimed.update(ids)
                         return candidate, "completed"
             except Exception as error:  # noqa: BLE001
                 self.log(f"relay: error while waiting for the agent: {error}")
