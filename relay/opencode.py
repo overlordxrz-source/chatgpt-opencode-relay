@@ -114,12 +114,25 @@ class _BridgeWorker:
         return payload
 
     # -------------------------------------------------------------------- public
+    async def _call_with_retry(self, tool: str, arguments: dict[str, Any]) -> Any:
+        """Call a tool, reconnecting once if the session went stale.
+
+        The bridge can be restarted underneath us (crash, upgrade, manual
+        restart); the old session id is then rejected and the call has to be
+        replayed on a fresh session.
+        """
+        try:
+            return await self._call_async(tool, arguments)
+        except Exception:
+            await self._disconnect()
+            return await self._call_async(tool, arguments)
+
     def call(self, tool: str, arguments: Optional[dict[str, Any]] = None, timeout: float = 300.0) -> Any:
         self.start()
         assert self._loop is not None
         with self._lock:
             future = asyncio.run_coroutine_threadsafe(
-                self._call_async(tool, arguments or {}), self._loop
+                self._call_with_retry(tool, arguments or {}), self._loop
             )
             try:
                 return future.result(timeout)

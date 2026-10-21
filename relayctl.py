@@ -391,6 +391,46 @@ def cmd_bootstrap_chat(args) -> int:
     return 0
 
 
+def cmd_sessions(args) -> int:
+    """List OpenCode sessions and whether the relay may drive them."""
+    data = config_mod.load_config()
+    token = config_mod.bridge_token(data)
+    opencode = OpenCodeAdapter(data["opencode"]["bridge_url"], token, log=_log)
+    allowed = list(data["opencode"].get("allowed_sessions") or [])
+    default = data["opencode"].get("default_session", "")
+    if default and default not in allowed:
+        allowed.append(default)
+    sessions = opencode.list_sessions(limit=50)
+    print(f"allowed_sessions: {allowed or '(none)'}\n")
+    for session in sessions:
+        sid = str(session.get("opencodeSessionId", ""))
+        title = str(session.get("title", ""))
+        ok = any(
+            sid.startswith(entry.strip()) or entry.strip().lower() in title.lower()
+            for entry in allowed
+            if entry.strip()
+        )
+        mark = "ALLOW" if ok else "  -  "
+        print(f"  {mark}  {sid[:18]}…  {title[:52]}  ({session.get('directory')})")
+    if args.allow:
+        target = args.allow.strip()
+        for session in sessions:
+            sid = str(session.get("opencodeSessionId", ""))
+            title = str(session.get("title", ""))
+            if target == sid or target.lower() in title.lower():
+                if target not in allowed:
+                    allowed.append(target)
+                    data["opencode"]["allowed_sessions"] = allowed
+                    config_mod.save_config(data)
+                    print(f"\nallowed now: {allowed}")
+                else:
+                    print(f"\nalready allowed: {allowed}")
+                return 0
+        print(f"no session matched {target!r}")
+        return 1
+    return 0
+
+
 def cmd_selftest(args) -> int:
     """Checkpoint A/B: read a message, send a message, exercise OpenCode."""
     data = config_mod.load_config()
@@ -481,6 +521,8 @@ def main() -> int:
     sub.add_parser("pause", help="pause the relay")
     sub.add_parser("resume", help="resume the relay")
     sub.add_parser("menubar", help="show the menu bar status UI")
+    sessions = sub.add_parser("sessions", help="list OpenCode sessions and the allow list")
+    sessions.add_argument("--allow", help="also add a session (id or title) to the allow list")
     logs = sub.add_parser("logs", help="show recent log lines")
     logs.add_argument("-n", "--lines", type=int, default=40)
     boot = sub.add_parser("bootstrap-chat", help="create a disposable conversation and teach it the protocol")
@@ -503,7 +545,9 @@ def main() -> int:
         "resume": cmd_resume,
         "logs": cmd_logs,
         "menubar": lambda _args: __import__("relay.menubar", fromlist=["run"]).run(),
+        "sessions": cmd_sessions,
         "menubar": lambda _args: __import__("relay.menubar", fromlist=["run"]).run(),
+        "sessions": cmd_sessions,
         "new-test-chat": cmd_new_test_chat,
         "bootstrap-chat": cmd_bootstrap_chat,
         "selftest": cmd_selftest,
