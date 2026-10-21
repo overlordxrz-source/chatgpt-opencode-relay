@@ -397,6 +397,9 @@ class RelayController:
         if duplicates:
             self.log("relay: skipping a duplicate request (idempotency guard)")
             return
+        # Reserve the request *before* the worker starts: two paths (seeding and
+        # the poll loop) can pick up the same command at the same moment.
+        reservation = self.store.reserve_exchange(command.session or "default", command.message)
         ok, reason = self._loop_guard(command)
         if not ok:
             self.log(f"relay: refusing command ({reason})")
@@ -450,14 +453,20 @@ class RelayController:
         # minutes, and the relay must keep watching the conversation meanwhile.
         worker = threading.Thread(
             target=self._run_exchange,
-            args=(command, session_id, label),
+            args=(command, session_id, label, reservation),
             name="relay-exchange",
             daemon=True,
         )
         self._workers.append(worker)
         worker.start()
 
-    def _run_exchange(self, command: protocol.Command, session_id: str, label: str) -> None:
+    def _run_exchange(
+        self,
+        command: protocol.Command,
+        session_id: str,
+        label: str,
+        reservation: int = 0,
+    ) -> None:
         """Send the request to the agent and deliver its answer to ChatGPT."""
         started = time.time()
         try:
@@ -508,13 +517,16 @@ class RelayController:
                     label or session_id, status, body, duration=duration, detail=detail
                 )
             )
-            self.store.record_exchange(
-                session=label or session_id,
-                request=command.message,
-                status=status,
-                response=reply_text,
-                started_at=started,
-            )
+            if reservation:
+                self.store.finish_exchange(reservation, status, reply_text)
+            else:
+                self.store.record_exchange(
+                    session=label or session_id,
+                    request=command.message,
+                    status=status,
+                    response=reply_text,
+                    started_at=started,
+                )
             self.status.last_status = status
             self.status.last_exchange_at = time.time()
         except Exception as error:  # noqa: BLE001 - report and keep running
@@ -522,13 +534,16 @@ class RelayController:
             self.log(f"relay: exchange failed: {message}")
             self.status.errors.append(message)
             self._post(protocol.format_reply(command.session or "default", "error", message))
-            self.store.record_exchange(
-                session=command.session or "default",
-                request=command.message,
-                status="error",
-                response=message,
-                started_at=started,
-            )
+            if reservation:
+                self.store.finish_exchange(reservation, "error", message)
+            else:
+                self.store.record_exchange(
+                    session=command.session or "default",
+                    request=command.message,
+                    status="error",
+                    response=message,
+                    started_at=started,
+                )
         finally:
             self.status.pending_task = ""
 
@@ -671,6 +686,17 @@ class RelayController:
                 f"relay[debug]: {conversation!r} visible={len(messages)} "
                 f"generating={self.chatgpt.is_generating()}"
             )
+
+        # A collapsed answer hides the end of a command block (the closing tag).
+        # Expand it and read again before deciding there is no command.
+        if messages and messages[-1].role == "assistant":
+            newest = messages[-1].text
+            if "[OPENCODE_SEND]" in newest and "[/OPENCODE_SEND]" not in newest:
+                if self.chatgpt.expand_latest(tree):
+                    tree = self.chatgpt.refresh_tree()
+                    messages = self.chatgpt.read_conversation(conversation, tree=tree)
+                    if not messages:
+                        return
 
         # Only the most recent messages are eligible: older ones that scroll
         # into view later must never be executed.

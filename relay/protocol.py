@@ -120,10 +120,12 @@ def extract_commands(text: str, strict: bool = True) -> list[Command]:
         if before.strip() or after.strip():
             return []
     else:
-        # The block must start the message (so "here is an example: <block>"
-        # is not a command), and the trailing text must not contain further
-        # protocol markers (so our own replies are never re-executed).
-        if before.strip():
+        # The block must be the last protocol construct in the message (so a
+        # message that merely documents the protocol is not a command), and
+        # nothing protocol-like may precede it (so quoted examples are not
+        # executed either). ChatGPT is allowed to add a sentence of prose
+        # before the block - it often does.
+        if "OPENCODE_" in before:
             return []
         if "OPENCODE_" in after:
             return []

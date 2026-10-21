@@ -178,6 +178,28 @@ class Store:
             )
             self._db.commit()
 
+    def reserve_exchange(self, session: str, request: str) -> int:
+        """Claim a request before the worker starts, so a concurrent duplicate
+        of the same request is refused instead of being delivered twice."""
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO exchanges(started_at, finished_at, session, request, status, response)"
+                " VALUES(?,?,?,?,?,?)",
+                (time.time(), None, session, request, "started", ""),
+            )
+            self._db.commit()
+            return int(cursor.lastrowid or 0)
+
+    def finish_exchange(
+        self, exchange_id: int, status: str, response: str = "", finished_at: Optional[float] = None
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE exchanges SET status=?, response=?, finished_at=? WHERE id=?",
+                (status, response, finished_at or time.time(), exchange_id),
+            )
+            self._db.commit()
+
     def count_since(self, seconds: float, executed_only: bool = True) -> int:
         """Count exchanges in a time window.
 
@@ -189,7 +211,7 @@ class Store:
             if executed_only:
                 row = self._db.execute(
                     "SELECT COUNT(*) AS n FROM exchanges WHERE started_at >= ? "
-                    "AND status NOT IN ('refused', 'error')",
+                    "AND status NOT IN ('refused', 'error', 'started')",
                     (cutoff,),
                 ).fetchone()
             else:

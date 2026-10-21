@@ -194,6 +194,20 @@ class ChatGPTApp:
         except Exception:
             return 0.0
 
+    def visible_window_title(self) -> str:
+        """Title of the frontmost on-screen window of this app."""
+        pid = self._pid
+        if pid is None:
+            self._resolve()
+            pid = self._pid
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID
+        )
+        for window in windows:
+            if window.get("kCGWindowOwnerPID") == pid and window.get("kCGWindowName"):
+                return str(window["kCGWindowName"])
+        return ""
+
     def window_bounds(self) -> Optional[tuple[float, float, float, float]]:
         """Screen coordinates (x, y, w, h) of the app's main window."""
         pid = self._pid

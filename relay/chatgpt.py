@@ -22,6 +22,8 @@ IGNORED_TEXT = {
     "Loading older messages…",
     "Loading older messages...",
     "Response complete",
+    "Latest response",
+    "ChatGPT can make mistakes. Check important info.",
 }
 
 
@@ -186,19 +188,63 @@ class ChatGPTAdapter:
         return self._window_title() == new_title
 
     # ----------------------------------------------------------------- messages
+    def expand_latest(self, tree: Optional[Node] = None) -> bool:
+        """Expand a collapsed message so its full text is rendered.
+
+        Long ChatGPT answers are collapsed behind a "Show more" button, and
+        the accessibility tree then only exposes the visible part - which cuts
+        a command block off before its closing tag.
+        """
+        tree = tree if tree is not None else self.app.tree()
+        window = self.window_node(tree)
+        scope = window if window is not None else tree
+        container = _find_by_description(scope, "Conversation")
+        scope = container if container is not None else scope
+        buttons = [b for b in scope.find_all(role="AXButton") if b.text.strip() == "Show more"]
+        if not buttons:
+            return False
+        self.log("chatgpt: expanding a collapsed message")
+        self.app.press(buttons[-1])
+        time.sleep(0.8)
+        return True
+
+    def window_node(self, tree: Optional[Node] = None) -> Optional[Node]:
+        """The window the user is actually looking at.
+
+        The app can hold more than one window, and it swaps which one is
+        front. Reading the first AX window could mean reading a background
+        conversation, so the visible window (from the window server) wins.
+        """
+        tree = tree if tree is not None else self.app.tree()
+        windows = tree.find_all(role="AXWindow")
+        if not windows:
+            return None
+        visible = self.app.visible_window_title()
+        if visible:
+            for window in windows:
+                if window.title == visible:
+                    return window
+        for window in windows:
+            if getattr(window, "identifier", "") == "AXMain" or window.help_text == "AXMain":
+                return window
+        return windows[0]
+
     def read_messages(self, retries: int = 3, tree: Optional[Node] = None) -> list[Message]:
         """Read the conversation that is on screen.
 
-        The app rebuilds its accessibility tree while it renders, so an empty
-        read is retried a few times before it is believed.
+        The whole visible window is walked, not just the group the app calls
+        "Conversation": the newest messages are rendered outside that group
+        (it holds the virtualised history), so reading only that group misses
+        exactly the messages that matter.
         """
         for attempt in range(max(1, retries)):
             current = tree if (tree is not None and attempt == 0) else self.app.tree()
-            container = _find_by_description(current, "Conversation")
-            if container is not None:
-                messages = _extract_messages(container)
-                if messages:
-                    return messages
+            window = self.window_node(current)
+            scope = window if window is not None else current
+            container = _find_by_description(scope, "Conversation")
+            messages = _extract_messages(container if container is not None else scope)
+            if messages:
+                return messages
             if attempt < retries - 1:
                 time.sleep(1.0)
         return []
@@ -366,63 +412,72 @@ def _paragraph_text(group: Node) -> str:
 
 
 def _extract_messages(container: Node) -> list[Message]:
-    """Walk the conversation subtree and rebuild ordered (role, text) messages."""
+    """Rebuild the conversation from a subtree.
+
+    The app renders a message in several different shapes (plain paragraphs,
+    collapsed "show more" bodies, inline code spans), and a rule that guesses
+    "a group with text is a paragraph" silently drops whole messages. So the
+    subtree is walked in document order instead, and the role of each message
+    comes from the app's own "You said:" / "ChatGPT said:" headings.
+    """
+    ordered: list[Node] = []
+
+    def walk(node: Node) -> None:
+        if node.role in (
+            "AXButton",
+            "AXCheckBox",
+            "AXPopUpButton",
+            "AXImage",
+            "AXMenu",
+            "AXMenuItem",
+            "AXTextArea",
+        ):
+            return  # controls carry no message text
+        ordered.append(node)
+        for child in node.children:
+            walk(child)
+
+    for child in container.children:
+        walk(child)
+
     messages: list[Message] = []
     role: Optional[str] = None
     buffer: list[str] = []
 
     def flush() -> None:
         nonlocal buffer
-        text = "\n".join(piece for piece in buffer if piece).strip()
+        text = " ".join(piece for piece in buffer if piece).strip()
         if role and text:
             messages.append(Message(role=role, text=text))
         buffer = []
 
-    def walk(node: Node) -> None:
-        nonlocal role
+    for node in ordered:
         if node.role == "AXHeading":
-            # The heading's own AXValue is the level ("4"); the label lives in a
-            # child static text ("You said:" / "ChatGPT said:").
-            label_parts = [child.text for child in node.children if child.role == "AXStaticText"]
-            label = " ".join(" ".join(label_parts).split()) or " ".join(node.text.split())
+            # The heading's own value is the level ("4"); the label is a child.
+            label = " ".join(
+                child.text for child in node.children if child.role == "AXStaticText"
+            ).strip() or node.text
             if USER_MARKER in label:
                 flush()
                 role = "user"
-                return
+                continue
             if ASSISTANT_MARKER in label:
                 flush()
                 role = "assistant"
-                return
-            return  # other headings ("Latest response", level markers) are not roles
-        if node.role in ("AXButton", "AXCheckBox", "AXPopUpButton", "AXImage", "AXMenu", "AXMenuItem", "AXTextArea"):
-            return  # controls, the composer and their labels are not message content
+                continue
+            continue
         if node.role == "AXStaticText":
             text = node.text.strip()
             if not text or text in IGNORED_TEXT or text in (USER_MARKER, ASSISTANT_MARKER):
-                return
+                continue
             if re.fullmatch(r"Worked for \d+.*", text):
-                return
+                continue
             if role:
                 buffer.append(text)
-            return
-        if node.role == "AXGroup":
-            # A group holding static text directly is one rendered paragraph -
-            # unless it also contains a role heading ("You said:"), in which
-            # case it is a message container and we have to walk into it.
-            has_heading = any(
-                child.role == "AXHeading"
-                or any(grand.role == "AXHeading" for grand in child.children)
-                for child in node.children
-            )
-            if not has_heading and any(child.role == "AXStaticText" for child in node.children):
-                text = _paragraph_text(node)
-                if text and role:
-                    buffer.append(text)
-                return
-        for child in node.children:
-            walk(child)
-
-    for child in container.children:
-        walk(child)
     flush()
     return messages
+
+
+def _extract_messages_from_subtree(root: Node) -> list[Message]:
+    """Alias kept for readability: messages inside any subtree."""
+    return _extract_messages(root)
