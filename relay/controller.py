@@ -112,6 +112,7 @@ class RelayController:
         # Per conversation state: the last handled message pair and the
         # conversation fingerprint.
         self._state: dict[str, dict] = {}
+        self.active_conversation: str = ""
         self._last_visit: dict[str, float] = {}
         self._pending_text: Optional[str] = None
         self._pending_hits = 0
@@ -485,6 +486,7 @@ class RelayController:
     def _tick_conversation(self, conversation: str) -> None:
         state = self._state.setdefault(conversation, {"fingerprint": None, "pair": None})
         self.chatgpt.conversation = conversation
+        self.active_conversation = conversation
 
         # Do not act on a message that is still streaming.
         if self.chatgpt.is_generating():

@@ -209,7 +209,7 @@ def cmd_run(args) -> int:
             payload = {
                 "running": True,
                 "paused": paused,
-                "conversation": relay_config.conversation,
+                "conversation": getattr(controller, "active_conversation", "") or relay_config.conversation,
                 "conversation_connected": controller.status.conversation_connected,
                 "opencode_attached": controller.status.opencode_attached,
                 "opencode_session": controller.status.opencode_session,
