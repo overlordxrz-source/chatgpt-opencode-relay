@@ -146,29 +146,49 @@ def cmd_run(args) -> int:
     seeded = False
     while not stopping["flag"]:
         try:
-            if not controller.ensure_conversation():
-                log("relay: cannot open the configured conversation")
-                time.sleep(5)
-                continue
             if not seeded:
-                controller.ensure_conversation()
-                messages = chatgpt.read_messages()
-                keys = [m.key for m in messages]
-                for index, message in enumerate(messages):
-                    store.mark_processed(
-                        message.key, message.role, prev=keys[index - 1] if index else ""
+                # Seed every watched conversation. A command that is already
+                # waiting (the newest assistant message with a command block)
+                # is deliberately left unprocessed so that it still runs.
+                # Seed only the conversation that is open: the relay answers
+                # in the conversation a request came from, so it never needs to
+                # move the app on startup.
+                open_title = chatgpt.current_title()
+                seed_targets = (
+                    [open_title] if open_title in (relay_config.conversations or []) else []
+                )
+                for conversation in seed_targets:
+                    if not conversation:
+                        continue
+                    chatgpt.conversation = conversation
+                    messages = chatgpt.read_conversation(conversation)
+                    pending = None
+                    for message in messages:
+                        if message.role == "assistant" and protocol.extract_commands(
+                            message.text, relay_config.strict_protocol
+                        ):
+                            pending = message
+                    keys = [m.key for m in messages]
+                    for index, message in enumerate(messages):
+                        if pending is not None and message.key == pending.key:
+                            continue
+                        store.mark_processed(
+                            message.key, message.role, prev=keys[index - 1] if index else ""
+                        )
+                    log(
+                        f"relay: seeded {conversation!r} with {len(messages)} messages"
+                        + (" (1 pending command kept)" if pending else "")
                     )
-                controller._window = [m.key for m in messages]
                 seeded = True
-                if relay_config.post_init_prompt:
+                if relay_config.post_init_prompt and seed_targets:
                     try:
                         allowed = controller.allowed_session_list()
                     except Exception as error:  # noqa: BLE001
                         log(f"relay: could not list allowed sessions: {error}")
                         allowed = []
                     log(f"relay: posting the initialisation prompt ({len(allowed)} allowed session(s))")
+                    chatgpt.conversation = seed_targets[0]
                     chatgpt.send(protocol.build_init_prompt(allowed))
-                log(f"relay: seeded with {len(messages)} existing messages")
 
             paused = pause_file.exists()
             controller.status.paused = paused
@@ -411,7 +431,7 @@ def cmd_sessions(args) -> int:
     default = data["opencode"].get("default_session", "")
     if default and default not in allowed:
         allowed.append(default)
-    sessions = opencode.list_sessions(limit=50)
+    sessions = opencode.list_sessions(limit=100)
     print(f"allowed_sessions: {allowed or '(none)'}\n")
     for session in sessions:
         sid = str(session.get("opencodeSessionId", ""))
@@ -428,9 +448,11 @@ def cmd_sessions(args) -> int:
         for session in sessions:
             sid = str(session.get("opencodeSessionId", ""))
             title = str(session.get("title", ""))
-            if target == sid or target.lower() in title.lower():
-                if target not in allowed:
-                    allowed.append(target)
+            if target == sid or target.lower() in title.lower() or target.lower() in sid.lower():
+                # Store the full session id so the entry is unambiguous.
+                entry = sid if target.lower() in sid.lower() else target
+                if entry not in allowed:
+                    allowed.append(entry)
                     data["opencode"]["allowed_sessions"] = allowed
                     config_mod.save_config(data)
                     print(f"\nallowed now: {allowed}")

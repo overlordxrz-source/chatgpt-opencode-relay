@@ -50,14 +50,14 @@ python3 -m venv .venv
 
 | Key | Meaning |
 |---|---|
-| `chatgpt.conversation` | Title of the conversation to watch |
+| `chatgpt.conversations` | Titles of the conversations to watch (list) |
 | `chatgpt.conversation_index` | Which sidebar entry with that title (0 = first) |
 | `chatgpt.poll_seconds` | How often the conversation is read (default 3 s) |
 | `opencode.bridge_url` | `http://127.0.0.1:8787/mcp` |
 | `opencode.bridge_env` | Path to the bridge `.env` (the token is read from here, never copied) |
 | `opencode.default_session` | OpenCode session used when the command names none |
 | `opencode.allowed_sessions` | **Allow list**: only these OpenCode sessions may be driven |
-| `limits.*` | Budgets: exchanges per hour/day, reply size, agent timeout, look-back |
+| `limits.*` | Budgets: exchanges per hour/day (default 60/200), reply size, agent timeout, look-back, duplicate window |
 | `paths.*` | State database, status file, log file |
 
 ## 4. Prepare the conversation
@@ -115,6 +115,18 @@ Rules that keep this safe (see `relay/protocol.py`):
 * duplicate requests are dropped (idempotency window);
 * budgets per hour/day and a loop guard stop runaway exchanges;
 * permission requests are reported, never approved.
+
+## 6b. Where the relay works
+
+* It works in the **frontmost** ChatGPT conversation, and only if that
+  conversation is whitelisted (`chatgpt.conversations`).
+* It **never switches conversations** on its own - it will not move the app
+  while you are chatting, and it will not scroll your window around.
+* A request that arrives in conversation A is answered **in conversation A**.
+* If the frontmost conversation is not whitelisted, the relay stays idle.
+* Practical consequence for the phone test: leave the desktop app on the
+  conversation you want to drive, and send the phone message to that same
+  conversation.
 
 ## 7. How it reads ChatGPT
 

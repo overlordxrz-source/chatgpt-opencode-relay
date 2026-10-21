@@ -173,11 +173,23 @@ class Store:
         ).fetchone()
         return int(row["n"])
 
-    def count_since(self, seconds: float) -> int:
+    def count_since(self, seconds: float, executed_only: bool = True) -> int:
+        """Count exchanges in a time window.
+
+        Refusals (budget, loop guard, allow list) are not work, so they do not
+        consume the budget.
+        """
         cutoff = time.time() - seconds
-        row = self._db.execute(
-            "SELECT COUNT(*) AS n FROM exchanges WHERE started_at >= ?", (cutoff,)
-        ).fetchone()
+        if executed_only:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM exchanges WHERE started_at >= ? "
+                "AND status NOT IN ('refused', 'error')",
+                (cutoff,),
+            ).fetchone()
+        else:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM exchanges WHERE started_at >= ?", (cutoff,)
+            ).fetchone()
         return int(row["n"])
 
     def recent_exchanges(self, limit: int = 10) -> list[sqlite3.Row]:
@@ -190,6 +202,12 @@ class Store:
     def last_exchange(self) -> Optional[sqlite3.Row]:
         rows = self.recent_exchanges(1)
         return rows[0] if rows else None
+
+    def clear_exchanges(self) -> int:
+        """Delete the exchange history (used to reset a spent budget)."""
+        cursor = self._db.execute("DELETE FROM exchanges")
+        self._db.commit()
+        return int(cursor.rowcount or 0)
 
     def close(self) -> None:
         self._db.close()

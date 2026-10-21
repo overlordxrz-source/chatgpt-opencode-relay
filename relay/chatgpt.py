@@ -39,12 +39,26 @@ class Message:
 
 
 class ChatGPTAdapter:
-    def __init__(self, app: ChatGPTApp, conversation: str, log=print, index: int = 0, debug: bool = False):
+    def __init__(
+        self,
+        app: ChatGPTApp,
+        conversation: str,
+        log=print,
+        index: int = 0,
+        debug: bool = False,
+        switch_policy: str = "idle",
+        idle_seconds: float = 120.0,
+    ):
         self.app = app
         self.conversation = conversation
         self.index = index
         self.log = log
         self.debug = debug
+        # "idle": switch when the user has not touched anything for a while.
+        # "never": never switch - the relay only works in a conversation that is
+        #          already open.
+        self.switch_policy = switch_policy
+        self.idle_seconds = idle_seconds
 
     # ------------------------------------------------------------------ helpers
     def _window_title(self) -> str:
@@ -65,7 +79,7 @@ class ChatGPTAdapter:
     def _conversation_node(self, tree: Node) -> Optional[Node]:
         return tree.find(description=None) if False else _find_by_description(tree, "Conversation")
 
-    def user_is_busy(self, idle_seconds: float = 15.0) -> bool:
+    def user_is_busy(self, idle_seconds: float | None = None) -> bool:
         """True while the user is actively using the ChatGPT app.
 
         The relay must not yank the conversation away from someone who is
@@ -73,13 +87,17 @@ class ChatGPTAdapter:
         """
         if not self.app.is_frontmost():
             return False
-        return self.app.seconds_since_last_input() < idle_seconds
+        limit = self.idle_seconds if idle_seconds is None else idle_seconds
+        return self.app.seconds_since_last_input() < limit
 
     def open_conversation(self, force: bool = False) -> bool:
         """Make sure the watched conversation is the one on screen."""
         tree = self.app.tree()
         if self._window_title() == self.conversation:
             return True
+        if self.switch_policy == "never" and not force:
+            self.log("chatgpt: switch policy is 'never', not switching conversations")
+            return False
         if not force and self.user_is_busy():
             self.log("chatgpt: user is active in the app, not switching conversations")
             return False
@@ -152,12 +170,33 @@ class ChatGPTAdapter:
         return self._window_title() == new_title
 
     # ----------------------------------------------------------------- messages
-    def read_messages(self) -> list[Message]:
-        tree = self.app.tree()
-        container = _find_by_description(tree, "Conversation")
-        if container is None:
+    def read_messages(self, retries: int = 3) -> list[Message]:
+        """Read the conversation that is on screen.
+
+        The app rebuilds its accessibility tree while it renders, so an empty
+        read is retried a few times before it is believed.
+        """
+        for attempt in range(max(1, retries)):
+            tree = self.app.tree()
+            container = _find_by_description(tree, "Conversation")
+            if container is not None:
+                messages = _extract_messages(container)
+                if messages:
+                    return messages
+            if attempt < retries - 1:
+                time.sleep(1.0)
+        return []
+
+    def read_conversation(self, title: str) -> list[Message]:
+        """Read a specific conversation, without ever switching.
+
+        The relay works in the conversation that is frontmost. If that is not
+        the requested one, there is nothing to read - the relay never moves
+        the app to another conversation on its own.
+        """
+        if self.current_title() != title:
             return []
-        return _extract_messages(container)
+        return self.read_messages()
 
     def latest_assistant_message(self) -> Optional[Message]:
         for message in reversed(self.read_messages()):
@@ -211,8 +250,14 @@ class ChatGPTAdapter:
         return None
 
     def send(self, text: str) -> bool:
-        """Type a message into the composer and submit it."""
-        if not self.open_conversation():
+        """Type a message into the composer and submit it.
+
+        The relay never moves the app: it writes into the conversation that is
+        already in front. If that is not the conversation we want to answer
+        in, the caller queues the reply instead.
+        """
+        if self.current_title() != self.conversation:
+            self.log("chatgpt: the wanted conversation is not in front, not switching")
             return False
         self.app.activate()
         time.sleep(0.4)
@@ -345,8 +390,15 @@ def _extract_messages(container: Node) -> list[Message]:
                 buffer.append(text)
             return
         if node.role == "AXGroup":
-            # A group holding static text directly is one rendered paragraph.
-            if any(child.role == "AXStaticText" for child in node.children):
+            # A group holding static text directly is one rendered paragraph -
+            # unless it also contains a role heading ("You said:"), in which
+            # case it is a message container and we have to walk into it.
+            has_heading = any(
+                child.role == "AXHeading"
+                or any(grand.role == "AXHeading" for grand in child.children)
+                for child in node.children
+            )
+            if not has_heading and any(child.role == "AXStaticText" for child in node.children):
                 text = _paragraph_text(node)
                 if text and role:
                     buffer.append(text)

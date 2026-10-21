@@ -24,8 +24,8 @@ class RelayConfig:
     allowed_sessions: list[str] = field(default_factory=list)
     poll_seconds: float = 3.0
     strict_protocol: bool = True
-    max_exchanges_per_hour: int = 12
-    max_exchanges_per_day: int = 40
+    max_exchanges_per_hour: int = 60
+    max_exchanges_per_day: int = 200
     max_reply_chars: int = 6000
     agent_timeout_ms: int = 180_000
     max_loop_repeats: int = 3
@@ -35,6 +35,10 @@ class RelayConfig:
     post_init_prompt: bool = True
     log_path: str = ""
     conversation_index: int = 0
+    conversations: list[str] = field(default_factory=list)
+    switch_policy: str = "idle"
+    idle_seconds: float = 120.0
+    rotation_seconds: float = 45.0
 
     @classmethod
     def from_dict(cls, data: dict) -> "RelayConfig":
@@ -43,6 +47,13 @@ class RelayConfig:
         limits = data.get("limits", {})
         return cls(
             conversation=chatgpt.get("conversation", ""),
+            conversations=list(
+                chatgpt.get("conversations")
+                or ([chatgpt.get("conversation", "")] if chatgpt.get("conversation") else [])
+            ),
+            switch_policy=chatgpt.get("switch_policy", "idle"),
+            idle_seconds=float(chatgpt.get("idle_seconds", 120)),
+            rotation_seconds=float(chatgpt.get("rotation_seconds", 45)),
             conversation_index=int(chatgpt.get("conversation_index", 0)),
             poll_seconds=float(chatgpt.get("poll_seconds", 3.0)),
             bridge_url=opencode.get("bridge_url", "http://127.0.0.1:8787/mcp"),
@@ -50,8 +61,8 @@ class RelayConfig:
             default_session=opencode.get("default_session", ""),
             allowed_sessions=list(opencode.get("allowed_sessions", []) or []),
             strict_protocol=bool(limits.get("strict_protocol", True)),
-            max_exchanges_per_hour=int(limits.get("max_exchanges_per_hour", 12)),
-            max_exchanges_per_day=int(limits.get("max_exchanges_per_day", 40)),
+            max_exchanges_per_hour=int(limits.get("max_exchanges_per_hour", 60)),
+            max_exchanges_per_day=int(limits.get("max_exchanges_per_day", 200)),
             max_reply_chars=int(limits.get("max_reply_chars", 6000)),
             agent_timeout_ms=int(limits.get("agent_timeout_ms", 180_000)),
             max_loop_repeats=int(limits.get("max_loop_repeats", 3)),
@@ -96,10 +107,10 @@ class RelayController:
         self.status = RelayStatus()
         self.on_conversation_renamed = on_conversation_renamed
         self.debug = bool(os.environ.get("RELAY_DEBUG"))
-        self._window: list[str] = []
-        # (predecessor key, own key) of the newest message we already handled.
-        # Two identical messages are told apart by what comes before them.
-        self._last_seen_pair: Optional[tuple[str, str]] = None
+        # Per conversation state: the last handled message pair and the
+        # conversation fingerprint.
+        self._state: dict[str, dict] = {}
+        self._last_visit: dict[str, float] = {}
         self._pending_text: Optional[str] = None
         self._pending_hits = 0
         self._last_seen_fingerprints: dict[str, list[float]] = {}
@@ -173,7 +184,9 @@ class RelayController:
                 return True
         return False
 
-    def _is_new(self, message: Message, predecessor: str, is_newest: bool) -> bool:
+    def _is_new(
+        self, message: Message, predecessor: str, is_newest: bool, state: dict
+    ) -> bool:
         """Is this message physically new?
 
         The accessibility tree has no message ids, so identity is by content.
@@ -282,6 +295,12 @@ class RelayController:
         ok, reason = self._budget_ok()
         if not ok:
             self.log(f"relay: refusing command ({reason})")
+            reason = (
+                f"{reason}. This is a safety budget in the relay, not an "
+                f"OpenCode or ChatGPT limit. Raise it in "
+                f"~/.chatgpt-opencode-relay/config.json (limits.max_exchanges_per_hour) "
+                f"or wait for the window to roll over."
+            )
             self.store.record_exchange(
                 session=command.session or "default",
                 request=command.message,
@@ -404,56 +423,73 @@ class RelayController:
             self.status.pending_task = ""
 
     # ---------------------------------------------------------------------- loop
-    def ensure_conversation(self) -> bool:
-        """Make sure the watched conversation is the one on screen.
-
-        Identity is by content fingerprint; the title is only a hint for
-        finding the conversation again in the sidebar.
-        """
-        stored = self.store.get("conversation_fingerprint")
-        if stored:
-            messages = self.chatgpt.read_messages()
-            if messages and self.chatgpt.fingerprint(messages) == stored:
-                return True
-        return self.chatgpt.open_conversation()
-
     def tick(self) -> None:
+        """One relay cycle.
+
+        The relay works with the conversation that is open: a request sent
+        from one whitelisted conversation is answered in that same
+        conversation. Only when another app is in front does the relay open a
+        whitelisted conversation itself.
+        """
         self.flush_pending_replies()
+        whitelisted = [c for c in (self.config.conversations or [self.config.conversation]) if c]
+        if not whitelisted:
+            return
+        try:
+            open_title = self.chatgpt.current_title()
+        except Exception:
+            open_title = ""
+        if open_title in whitelisted:
+            targets = [open_title]
+        else:
+            # The frontmost conversation is not whitelisted: the relay stays
+            # out of it and does not move the app anywhere else.
+            return
+        for conversation in targets:
+            try:
+                self._tick_conversation(conversation)
+            except Exception as error:  # noqa: BLE001 - one conversation must not kill the loop
+                self.log(f"relay: error in {conversation!r}: {type(error).__name__}: {error}")
+
+    def _tick_conversation(self, conversation: str) -> None:
+        state = self._state.setdefault(conversation, {"fingerprint": None, "pair": None})
+        self.chatgpt.conversation = conversation
+
         # Do not act on a message that is still streaming.
         if self.chatgpt.is_generating():
             return
-        messages = self.chatgpt.read_messages()
+
+        messages = self.chatgpt.read_conversation(conversation)
         if not messages:
             self.status.conversation_connected = False
             return
-        self.status.conversation_connected = True
 
         # Identify the conversation by content: ChatGPT renames conversations,
         # so the title alone is not a stable identifier.
         fingerprint = self.chatgpt.fingerprint(messages)
-        stored = self.store.get("conversation_fingerprint")
+        stored = state.get("fingerprint")
         if stored and stored != fingerprint:
-            if not self.chatgpt.open_conversation():
-                self.status.conversation_connected = False
-                return
-            messages = self.chatgpt.read_messages()
-            if not messages:
-                return
-            fingerprint = self.chatgpt.fingerprint(messages)
+            # The user moved to a different conversation; that is fine, the
+            # relay simply follows whatever is in front.
+            self.status.conversation_connected = False
+            return
         if stored != fingerprint:
-            self.store.set("conversation_fingerprint", fingerprint)
+            state["fingerprint"] = fingerprint
+        self.status.conversation_connected = True
 
         title = self.chatgpt.current_title()
-        if title and title != self.config.conversation:
-            self.log(f"relay: conversation was renamed to {title!r}; following it")
-            self.config.conversation = title
-            self.store.set("conversation_title", title)
+        if title and title != conversation and title in self.config.conversations:
+            # The app renamed one of the watched conversations; follow it.
+            self.log(f"relay: {conversation!r} was renamed to {title!r}; following it")
+            self.config.conversations = [
+                title if item == conversation else item for item in self.config.conversations
+            ]
             if self.on_conversation_renamed:
                 self.on_conversation_renamed(title)
 
         if self.debug:
             self.log(
-                f"relay[debug]: visible={len(messages)} "
+                f"relay[debug]: {conversation!r} visible={len(messages)} "
                 f"generating={self.chatgpt.is_generating()}"
             )
 
@@ -464,7 +500,7 @@ class RelayController:
             position = len(messages) - self.config.lookback_messages + index
             predecessor = keys[position - 1] if position > 0 else ""
             is_newest = position == len(messages) - 1
-            if not self._is_new(message, predecessor, is_newest):
+            if not self._is_new(message, predecessor, is_newest, state):
                 continue
             if message.role != "assistant":
                 self.store.mark_processed(message.key, message.role, prev=predecessor)
