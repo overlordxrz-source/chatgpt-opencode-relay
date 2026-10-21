@@ -103,6 +103,19 @@ class RelayStatus:
     exchanges_today: int = 0
 
 
+SKIP_ROLES = {
+    "idle",
+    "system",
+    "compaction",
+    "agent-switched",
+    "model-switched",
+    "location-switched",
+    "shell",
+    "skill",
+    "synthetic",
+}
+
+
 class RelayController:
     def __init__(
         self,
@@ -583,17 +596,13 @@ class RelayController:
         stable_hits = 0
         while time.time() < deadline:
             try:
-                page = self.opencode.messages(
-                    bridge_session_id, limit=200, since_message_id=accepted_id
-                )
-                matched = bool(page.get("matchedSince", True))
+                # Read the whole window and filter by time. The cursor is only
+                # a hint: a server that does not own the session (the bridge
+                # spawns its own, the agent runs in the background service)
+                # never resolves the cursor, yet its window does contain the
+                # answer. The timestamp is the authoritative guard.
+                page = self.opencode.messages(bridge_session_id, limit=200)
                 messages = page.get("messages") or []
-                if not matched:
-                    # The cursor did not resolve: that window is not evidence
-                    # of anything new. Fall back to the timestamp filter.
-                    self.log("relay: message cursor did not match, filtering by time")
-                    page = self.opencode.messages(bridge_session_id, limit=200)
-                    messages = page.get("messages") or []
                 fresh = [
                     m
                     for m in messages
@@ -606,8 +615,15 @@ class RelayController:
                 # trailing run of assistant messages, not just the first.
                 run: list[dict] = []
                 for message in reversed(fresh):
-                    if message.get("role") != "assistant" or not message.get("text"):
-                        break
+                    role = message.get("role")
+                    if role in SKIP_ROLES and not message.get("text"):
+                        # A turn ends with an idle marker, and the app also emits
+                        # system/compaction events: skip them, do not stop here.
+                        continue
+                    if role != "assistant":
+                        break  # a new user message starts a new turn
+                    if not message.get("text"):
+                        continue  # an empty assistant segment
                     if str(message.get("id")) in claimed:
                         break
                     run.append(message)

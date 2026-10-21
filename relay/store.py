@@ -250,11 +250,16 @@ class Store:
         return int(row["n"])
 
     def recent_exchange_with_request(self, request: str, seconds: float) -> int:
-        """How often this exact request was already executed recently."""
+        """How often this exact request was already executed recently.
+
+        Interrupted/abandoned rows do not count: a request that was in flight
+        when the relay died must still be deliverable.
+        """
         cutoff = time.time() - seconds
         with self._lock:
             row = self._db.execute(
-                "SELECT COUNT(*) AS n FROM exchanges WHERE request=? AND started_at >= ?",
+                "SELECT COUNT(*) AS n FROM exchanges WHERE request=? AND started_at >= ? "
+                "AND status NOT IN ('interrupted', 'abandoned')",
                 (request, cutoff),
             ).fetchone()
         return int(row["n"])
