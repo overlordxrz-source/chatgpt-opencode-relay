@@ -75,6 +75,15 @@ class ChatGPTAdapter:
 
     # ------------------------------------------------------------------ helpers
     def _window_title(self) -> str:
+        """Title of the window the user is actually looking at.
+
+        The app keeps older windows alive, and AXWindows[0] is whichever was
+        created first - not necessarily the one on screen. Reading that made the
+        relay believe the watched conversation was gone and go idle.
+        """
+        visible = self.app.visible_window_title()
+        if visible:
+            return visible
         if self._tree is not None:
             windows = self._tree.find_all(role="AXWindow")
             if windows:
@@ -267,9 +276,15 @@ class ChatGPTAdapter:
         return None
 
     def is_generating(self, tree: Optional[Node] = None) -> bool:
-        """True while the assistant is still streaming a response."""
+        """True while the assistant is still streaming a response.
+
+        Scoped to the visible window: a background window that happens to be
+        generating must not stall the relay.
+        """
         tree = tree if tree is not None else self.app.tree()
-        for node in tree.find_all(role="AXButton"):
+        window = self.window_node(tree)
+        scope = window if window is not None else tree
+        for node in scope.find_all(role="AXButton"):
             title = node.title.lower()
             if title in ("stop", "stop generating", "stop response"):
                 return True

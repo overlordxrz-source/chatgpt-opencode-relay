@@ -236,6 +236,7 @@ def cmd_run(args) -> int:
                 "paused": paused,
                 "conversation": getattr(controller, "active_conversation", "") or relay_config.conversation,
                 "conversation_connected": controller.status.conversation_connected,
+                "chatgpt_busy": controller.status.chatgpt_busy,
                 "opencode_attached": controller.status.opencode_attached,
                 "opencode_session": controller.status.opencode_session,
                 "last_exchange_at": controller.status.last_exchange_at,

@@ -92,6 +92,7 @@ class RelayStatus:
     running: bool = False
     paused: bool = False
     conversation_connected: bool = False
+    chatgpt_busy: bool = False
     opencode_attached: bool = False
     opencode_session: str = ""
     bridge_session_id: str = ""
@@ -654,12 +655,19 @@ class RelayController:
 
         # One accessibility walk per cycle, reused by every check below.
         tree = self.chatgpt.refresh_tree()
-        if self.chatgpt.is_generating(tree):
-            return
-
         messages = self.chatgpt.read_conversation(conversation, tree=tree)
         if not messages:
+            if self.status.conversation_connected:
+                self.log(f"relay: {conversation!r} is not readable right now (idling)")
             self.status.conversation_connected = False
+            return
+        if not self.status.conversation_connected:
+            self.log(f"relay: {conversation!r} is readable again")
+        self.status.conversation_connected = True
+        # A streaming answer is not actionable yet: wait for the next cycle.
+        # (Reported as connected-but-busy, not as disconnected.)
+        self.status.chatgpt_busy = self.chatgpt.is_generating(tree)
+        if self.status.chatgpt_busy:
             return
 
         # Identify the conversation by content: ChatGPT renames conversations,
