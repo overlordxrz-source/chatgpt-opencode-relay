@@ -44,6 +44,12 @@ class Store:
                 status TEXT,
                 response TEXT
             );
+            CREATE TABLE IF NOT EXISTS pending_replies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL,
+                text TEXT,
+                attempts INTEGER DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS kv (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -107,6 +113,32 @@ class Store:
     def is_posted(self, key: str) -> bool:
         row = self._db.execute("SELECT 1 FROM posts WHERE key=?", (key,)).fetchone()
         return row is not None
+
+    # ---------------------------------------------------------- pending replies
+    def add_pending_reply(self, text: str) -> int:
+        cursor = self._db.execute(
+            "INSERT INTO pending_replies(created_at, text, attempts) VALUES(?,?,0)",
+            (time.time(), text),
+        )
+        self._db.commit()
+        return int(cursor.lastrowid or 0)
+
+    def pending_replies(self, limit: int = 5) -> list[sqlite3.Row]:
+        return list(
+            self._db.execute(
+                "SELECT * FROM pending_replies ORDER BY id ASC LIMIT ?", (limit,)
+            )
+        )
+
+    def bump_pending_reply(self, reply_id: int) -> None:
+        self._db.execute(
+            "UPDATE pending_replies SET attempts = attempts + 1 WHERE id=?", (reply_id,)
+        )
+        self._db.commit()
+
+    def delete_pending_reply(self, reply_id: int) -> None:
+        self._db.execute("DELETE FROM pending_replies WHERE id=?", (reply_id,))
+        self._db.commit()
 
     # --------------------------------------------------------------- exchanges
     def record_exchange(

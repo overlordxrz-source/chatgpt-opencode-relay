@@ -50,7 +50,11 @@ def _build(config_data: dict):
     token = config_mod.bridge_token(config_data)
     app = ChatGPTApp()
     chatgpt = ChatGPTAdapter(
-        app, relay_config.conversation, log=_log, index=relay_config.conversation_index
+        app,
+        relay_config.conversation,
+        log=_log,
+        index=relay_config.conversation_index,
+        debug=bool(os.environ.get("RELAY_DEBUG")),
     )
     opencode = OpenCodeAdapter(relay_config.bridge_url, token, log=_log)
     store = Store(config_mod.path_of(config_data, "state_db"))

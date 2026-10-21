@@ -39,11 +39,12 @@ class Message:
 
 
 class ChatGPTAdapter:
-    def __init__(self, app: ChatGPTApp, conversation: str, log=print, index: int = 0):
+    def __init__(self, app: ChatGPTApp, conversation: str, log=print, index: int = 0, debug: bool = False):
         self.app = app
         self.conversation = conversation
         self.index = index
         self.log = log
+        self.debug = debug
 
     # ------------------------------------------------------------------ helpers
     def _window_title(self) -> str:
@@ -64,11 +65,30 @@ class ChatGPTAdapter:
     def _conversation_node(self, tree: Node) -> Optional[Node]:
         return tree.find(description=None) if False else _find_by_description(tree, "Conversation")
 
-    def open_conversation(self) -> bool:
+    def user_is_busy(self, idle_seconds: float = 15.0) -> bool:
+        """True while the user is actively using the ChatGPT app.
+
+        The relay must not yank the conversation away from someone who is
+        typing; it waits until they are idle.
+        """
+        if not self.app.is_frontmost():
+            return False
+        return self.app.seconds_since_last_input() < idle_seconds
+
+    def open_conversation(self, force: bool = False) -> bool:
         """Make sure the watched conversation is the one on screen."""
         tree = self.app.tree()
         if self._window_title() == self.conversation:
             return True
+        if not force and self.user_is_busy():
+            self.log("chatgpt: user is active in the app, not switching conversations")
+            return False
+        if self.debug:
+            self.log(
+                f"chatgpt[debug]: switching to {self.conversation!r} "
+                f"(frontmost={self.app.is_frontmost()}, "
+                f"idle={self.app.seconds_since_last_input():.1f}s)"
+            )
         matches = [b for b in tree.find_all(role="AXButton") if b.text.strip() == self.conversation]
         button = matches[self.index] if len(matches) > self.index else None
         if button is None and matches:

@@ -106,12 +106,28 @@ class RelayController:
 
     # ------------------------------------------------------------------ helpers
     def _post(self, text: str) -> bool:
+        """Post a message into the conversation, queueing it if that fails.
+
+        The user may be busy in another conversation; the reply is kept and
+        delivered as soon as the conversation can be used again.
+        """
         key = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
         self.store.mark_posted(key)
         ok = self.chatgpt.send(text)
         if not ok:
-            self.status.errors.append(f"failed to post to chatgpt: {text[:60]!r}")
+            self.status.errors.append(f"queued a reply for later: {text[:60]!r}")
+            self.store.add_pending_reply(text)
         return ok
+
+    def flush_pending_replies(self) -> None:
+        """Deliver replies that could not be posted earlier."""
+        for reply in self.store.pending_replies(limit=5):
+            if self.chatgpt.send(reply["text"]):
+                self.store.delete_pending_reply(int(reply["id"]))
+                self.log("relay: delivered a queued reply")
+            else:
+                self.store.bump_pending_reply(int(reply["id"]))
+                return
 
     def _new_messages(self, messages: list[Message]) -> tuple[list[Message], bool]:
         """Return (new messages, aligned).
@@ -157,18 +173,21 @@ class RelayController:
                 return True
         return False
 
-    def _is_new(self, message: Message, predecessor: str) -> bool:
+    def _is_new(self, message: Message, predecessor: str, is_newest: bool) -> bool:
         """Is this message physically new?
 
-        The accessibility tree has no message ids. A message is new when it was
-        never processed, or when the same text appears again with a different
-        predecessor (a genuine repeat) after the repeat window has passed.
+        The accessibility tree has no message ids, so identity is by content.
+        A message is new when it was never processed. It can also be new when
+        the *same text* shows up again - but only for the newest visible
+        message: older messages keep their predecessor even when the app
+        virtualises the window, so a changed predecessor there would mean
+        "the window moved", not "a new message".
         """
         info = self.store.processed_info(message.key)
         if info is None:
             return True
         seen_at, previous = info
-        if previous and previous != predecessor:
+        if is_newest and previous and previous != predecessor:
             if (time.time() - seen_at) > self.config.repeat_window_seconds:
                 return True
         return False
@@ -399,6 +418,7 @@ class RelayController:
         return self.chatgpt.open_conversation()
 
     def tick(self) -> None:
+        self.flush_pending_replies()
         # Do not act on a message that is still streaming.
         if self.chatgpt.is_generating():
             return
@@ -443,7 +463,8 @@ class RelayController:
         for index, message in enumerate(messages[-self.config.lookback_messages :]):
             position = len(messages) - self.config.lookback_messages + index
             predecessor = keys[position - 1] if position > 0 else ""
-            if not self._is_new(message, predecessor):
+            is_newest = position == len(messages) - 1
+            if not self._is_new(message, predecessor, is_newest):
                 continue
             if message.role != "assistant":
                 self.store.mark_processed(message.key, message.role, prev=predecessor)

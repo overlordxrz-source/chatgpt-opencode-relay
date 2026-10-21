@@ -172,6 +172,28 @@ class ChatGPTApp:
                 return True
         return False
 
+    def is_frontmost(self) -> bool:
+        """Is the ChatGPT app the active application?"""
+        try:
+            from AppKit import NSWorkspace
+
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return bool(app) and app.bundleIdentifier() in self.bundle_ids
+        except Exception:
+            return False
+
+    @staticmethod
+    def seconds_since_last_input() -> float:
+        """Seconds since the last system-wide user input event."""
+        try:
+            return float(
+                Quartz.CGEventSourceSecondsSinceLastEventType(
+                    Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType
+                )
+            )
+        except Exception:
+            return 0.0
+
     def window_bounds(self) -> Optional[tuple[float, float, float, float]]:
         """Screen coordinates (x, y, w, h) of the app's main window."""
         pid = self._pid
