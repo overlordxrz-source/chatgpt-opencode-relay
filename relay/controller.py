@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import re
 import time
 from dataclasses import dataclass, field
@@ -113,6 +114,7 @@ class RelayController:
         # conversation fingerprint.
         self._state: dict[str, dict] = {}
         self.active_conversation: str = ""
+        self._workers: list[threading.Thread] = []
         self._last_visit: dict[str, float] = {}
         self._pending_text: Optional[str] = None
         self._pending_hits = 0
@@ -387,6 +389,19 @@ class RelayController:
             f"relay: delivering to session {label!r} ({session_id}) "
             f"(requested {command.session or 'default'!r})"
         )
+        # The exchange runs in the background: an agent turn can take many
+        # minutes, and the relay must keep watching the conversation meanwhile.
+        worker = threading.Thread(
+            target=self._run_exchange,
+            args=(command, session_id, label),
+            name="relay-exchange",
+            daemon=True,
+        )
+        self._workers.append(worker)
+        worker.start()
+
+    def _run_exchange(self, command: protocol.Command, session_id: str, label: str) -> None:
+        """Send the request to the agent and deliver its answer to ChatGPT."""
         started = time.time()
         try:
             attached = self.opencode.attach(session_id)
@@ -395,27 +410,26 @@ class RelayController:
             self.status.opencode_attached = True
             self.status.opencode_session = label
 
-            result = self.opencode.send(
-                bridge_session_id,
-                command.message,
-                wait=True,
-                timeout_ms=self.config.agent_timeout_ms,
+            # Hand the request over without waiting: the agent may need many
+            # minutes, and the answer is collected below.
+            accepted = self.opencode.send(
+                bridge_session_id, command.message, wait=False
             )
-            completion = result.get("completion") or {}
-            messages = completion.get("messages") or []
-            reply_text = "\n\n".join(
-                m.get("text", "") for m in messages if m.get("role") == "assistant" and m.get("text")
-            ).strip()
-            if not reply_text:
-                reply_text = "(the agent did not return any text)"
+            accepted_id = (accepted.get("accepted") or {}).get("id")
+            self.log(f"relay: request delivered to the agent (id {accepted_id})")
+
+            reply_text, status = self._await_agent_reply(
+                bridge_session_id, accepted_id, command.message
+            )
 
             permissions = []
             try:
-                permissions = (self.opencode.permissions(bridge_session_id) or {}).get("permissions") or []
+                permissions = (
+                    self.opencode.permissions(bridge_session_id) or {}
+                ).get("permissions") or []
             except Exception:
                 permissions = []
 
-            status = "completed" if completion.get("completed") else "timeout"
             detail = None
             if permissions:
                 detail = (
@@ -428,7 +442,9 @@ class RelayController:
             if permissions:
                 body += "\n\n[permission pending] " + detail
             self._post(
-                protocol.format_reply(label or session_id, status, body, duration=duration, detail=detail)
+                protocol.format_reply(
+                    label or session_id, status, body, duration=duration, detail=detail
+                )
             )
             self.store.record_exchange(
                 session=label or session_id,
@@ -453,6 +469,46 @@ class RelayController:
             )
         finally:
             self.status.pending_task = ""
+
+    def _await_agent_reply(
+        self, bridge_session_id: str, accepted_id: Optional[str], request: str
+    ) -> tuple[str, str]:
+        """Wait for the agent to answer, without a short fixed timeout.
+
+        The agent is a real coding session: its turn can take minutes. The
+        relay watches the session and returns as soon as the agent produced an
+        answer, instead of guessing after a fixed sleep.
+        """
+        deadline = time.time() + (self.config.agent_timeout_ms / 1000) + 300
+        last_text = ""
+        while time.time() < deadline:
+            try:
+                page = self.opencode.messages(
+                    bridge_session_id, limit=50, since_message_id=accepted_id
+                )
+                texts = [
+                    m.get("text", "")
+                    for m in (page.get("messages") or [])
+                    if m.get("role") == "assistant" and m.get("text")
+                ]
+                if texts:
+                    last_text = texts[-1]
+                try:
+                    state = self.opencode.status(bridge_session_id).get("status", {})
+                    running = bool(state.get("running"))
+                except Exception:
+                    running = True
+                if last_text and not running:
+                    return last_text, "completed"
+                if last_text and running and len(texts) > 1:
+                    # The agent is still working but already answered.
+                    return last_text, "completed"
+            except Exception as error:  # noqa: BLE001
+                self.log(f"relay: error while waiting for the agent: {error}")
+            time.sleep(3)
+        if last_text:
+            return last_text, "completed"
+        return f"(the agent did not answer within {int((self.config.agent_timeout_ms / 1000) + 300)}s)", "timeout"
 
     # ---------------------------------------------------------------------- loop
     def tick(self) -> None:

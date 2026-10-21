@@ -174,10 +174,17 @@ def cmd_run(args) -> int:
                     messages = chatgpt.read_conversation(conversation)
                     pending = None
                     for message in messages:
-                        if message.role == "assistant" and protocol.extract_commands(
+                        if message.role != "assistant":
+                            continue
+                        commands = protocol.extract_commands(
                             message.text, relay_config.strict_protocol
-                        ):
-                            pending = message
+                        )
+                        if not commands:
+                            continue
+                        # Only keep a command that was never delivered.
+                        if store.recent_exchange_with_request(commands[0].message, 3600):
+                            continue
+                        pending = message
                     keys = [m.key for m in messages]
                     for index, message in enumerate(messages):
                         if pending is not None and message.key == pending.key:
