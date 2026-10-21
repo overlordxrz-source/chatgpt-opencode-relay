@@ -59,9 +59,24 @@ class ChatGPTAdapter:
         #          already open.
         self.switch_policy = switch_policy
         self.idle_seconds = idle_seconds
+        # One accessibility walk per cycle costs ~1s, so it is cached and
+        # reused by everything in the same cycle.
+        self._tree: Optional[Node] = None
+
+    def refresh_tree(self) -> Node:
+        self._tree = self.app.tree()
+        return self._tree
+
+    @property
+    def tree(self) -> Optional[Node]:
+        return self._tree
 
     # ------------------------------------------------------------------ helpers
     def _window_title(self) -> str:
+        if self._tree is not None:
+            windows = self._tree.find_all(role="AXWindow")
+            if windows:
+                return windows[0].title
         node = self.app.window()
         return node.title if node else ""
 
@@ -93,6 +108,7 @@ class ChatGPTAdapter:
     def open_conversation(self, force: bool = False) -> bool:
         """Make sure the watched conversation is the one on screen."""
         tree = self.app.tree()
+        self._tree = tree
         if self._window_title() == self.conversation:
             return True
         if self.switch_policy == "never" and not force:
@@ -170,15 +186,15 @@ class ChatGPTAdapter:
         return self._window_title() == new_title
 
     # ----------------------------------------------------------------- messages
-    def read_messages(self, retries: int = 3) -> list[Message]:
+    def read_messages(self, retries: int = 3, tree: Optional[Node] = None) -> list[Message]:
         """Read the conversation that is on screen.
 
         The app rebuilds its accessibility tree while it renders, so an empty
         read is retried a few times before it is believed.
         """
         for attempt in range(max(1, retries)):
-            tree = self.app.tree()
-            container = _find_by_description(tree, "Conversation")
+            current = tree if (tree is not None and attempt == 0) else self.app.tree()
+            container = _find_by_description(current, "Conversation")
             if container is not None:
                 messages = _extract_messages(container)
                 if messages:
@@ -187,7 +203,7 @@ class ChatGPTAdapter:
                 time.sleep(1.0)
         return []
 
-    def read_conversation(self, title: str) -> list[Message]:
+    def read_conversation(self, title: str, tree: Optional[Node] = None) -> list[Message]:
         """Read a specific conversation, without ever switching.
 
         The relay works in the conversation that is frontmost. If that is not
@@ -196,7 +212,7 @@ class ChatGPTAdapter:
         """
         if self.current_title() != title:
             return []
-        return self.read_messages()
+        return self.read_messages(tree=tree)
 
     def latest_assistant_message(self) -> Optional[Message]:
         for message in reversed(self.read_messages()):
@@ -204,9 +220,9 @@ class ChatGPTAdapter:
                 return message
         return None
 
-    def is_generating(self) -> bool:
+    def is_generating(self, tree: Optional[Node] = None) -> bool:
         """True while the assistant is still streaming a response."""
-        tree = self.app.tree()
+        tree = tree if tree is not None else self.app.tree()
         for node in tree.find_all(role="AXButton"):
             title = node.title.lower()
             if title in ("stop", "stop generating", "stop response"):

@@ -472,11 +472,16 @@ class RelayController:
             accepted = self.opencode.send(
                 bridge_session_id, command.message, wait=False
             )
-            accepted_id = (accepted.get("accepted") or {}).get("id")
-            self.log(f"relay: request delivered to the agent (id {accepted_id})")
+            entry = accepted.get("accepted") or {}
+            accepted_id = entry.get("id")
+            request_created_at = float((entry.get("time") or {}).get("created") or 0)
+            self.log(
+                f"relay: request delivered to the agent (id {accepted_id}, "
+                f"created {request_created_at})"
+            )
 
             reply_text, status = self._await_agent_reply(
-                bridge_session_id, accepted_id, command.message
+                bridge_session_id, accepted_id, command.message, request_created_at
             )
 
             permissions = []
@@ -528,44 +533,75 @@ class RelayController:
             self.status.pending_task = ""
 
     def _await_agent_reply(
-        self, bridge_session_id: str, accepted_id: Optional[str], request: str
+        self,
+        bridge_session_id: str,
+        accepted_id: Optional[str],
+        request: str,
+        request_created_at: float = 0.0,
     ) -> tuple[str, str]:
-        """Wait for the agent to answer, without a short fixed timeout.
+        """Wait for the answer to *this* request.
 
-        The agent is a real coding session: its turn can take minutes. The
-        relay watches the session and returns as soon as the agent produced an
-        answer, instead of guessing after a fixed sleep.
+        Correlation rules (stale-reply-debug-20261021):
+
+        1. Only messages created **after** this request count. The request
+           timestamp comes from the inbox entry the bridge accepted, so an
+           answer from an earlier turn can never be mistaken for this one.
+        2. The bridge's ``sinceMessageId`` cursor is honoured, and if the
+           cursor cannot be found the window is ignored rather than treated
+           as "everything is new".
+        3. The first assistant message after the request is the answer - not
+           the newest one, which may belong to a later, concurrent request.
+        4. The agent must have finished its turn (not running) and the text
+           must be unchanged over two consecutive polls.
         """
-        deadline = time.time() + (self.config.agent_timeout_ms / 1000) + 300
-        last_text = ""
+        budget = self.config.agent_timeout_ms / 1000
+        deadline = time.time() + budget
+        if not request_created_at:
+            request_created_at = time.time() * 1000
+        candidate: Optional[str] = None
+        stable_hits = 0
         while time.time() < deadline:
             try:
                 page = self.opencode.messages(
-                    bridge_session_id, limit=50, since_message_id=accepted_id
+                    bridge_session_id, limit=200, since_message_id=accepted_id
                 )
-                texts = [
+                matched = bool(page.get("matchedSince", True))
+                messages = page.get("messages") or []
+                if not matched:
+                    # The cursor did not resolve: that window is not evidence
+                    # of anything new. Fall back to the timestamp filter.
+                    self.log("relay: message cursor did not match, filtering by time")
+                    page = self.opencode.messages(bridge_session_id, limit=200)
+                    messages = page.get("messages") or []
+                fresh = [
+                    m
+                    for m in messages
+                    if float(m.get("createdAt") or 0) >= request_created_at
+                ]
+                answers = [
                     m.get("text", "")
-                    for m in (page.get("messages") or [])
+                    for m in fresh
                     if m.get("role") == "assistant" and m.get("text")
                 ]
-                if texts:
-                    last_text = texts[-1]
                 try:
                     state = self.opencode.status(bridge_session_id).get("status", {})
                     running = bool(state.get("running"))
                 except Exception:
                     running = True
-                if last_text and not running:
-                    return last_text, "completed"
-                if last_text and running and len(texts) > 1:
-                    # The agent is still working but already answered.
-                    return last_text, "completed"
+                if answers and not running:
+                    if answers[0] == candidate:
+                        stable_hits += 1
+                    else:
+                        candidate = answers[0]
+                        stable_hits = 1
+                    if stable_hits >= 2:
+                        return candidate, "completed"
             except Exception as error:  # noqa: BLE001
                 self.log(f"relay: error while waiting for the agent: {error}")
-            time.sleep(3)
-        if last_text:
-            return last_text, "completed"
-        return f"(the agent did not answer within {int((self.config.agent_timeout_ms / 1000) + 300)}s)", "timeout"
+            time.sleep(0.5)
+        if candidate:
+            return candidate, "completed"
+        return (f"(the agent did not answer within {int(budget)}s)", "timeout")
 
     # ---------------------------------------------------------------------- loop
     def tick(self) -> None:
@@ -601,11 +637,12 @@ class RelayController:
         self.chatgpt.conversation = conversation
         self.active_conversation = conversation
 
-        # Do not act on a message that is still streaming.
-        if self.chatgpt.is_generating():
+        # One accessibility walk per cycle, reused by every check below.
+        tree = self.chatgpt.refresh_tree()
+        if self.chatgpt.is_generating(tree):
             return
 
-        messages = self.chatgpt.read_conversation(conversation)
+        messages = self.chatgpt.read_conversation(conversation, tree=tree)
         if not messages:
             self.status.conversation_connected = False
             return
@@ -653,10 +690,8 @@ class RelayController:
             if not commands:
                 self.store.mark_processed(message.key, message.role, prev=predecessor)
                 continue
-            if not self._is_stable(message):
-                # The reply is still streaming: wait for the final text so the
-                # same command is never executed twice.
-                continue
+            # A command block that is closed is a finished message: the parser
+            # needs the closing tag, so a half streamed reply never matches.
             self.store.mark_processed(message.key, message.role, prev=predecessor)
             command = commands[0]
             self.log(f"relay: command for session {command.session!r}: {command.message[:80]!r}")
