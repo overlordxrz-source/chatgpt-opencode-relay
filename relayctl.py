@@ -173,6 +173,7 @@ def cmd_run(args) -> int:
                 seed_targets = (
                     [open_title] if open_title in (relay_config.conversations or []) else []
                 )
+                messages: list = []
                 for conversation in seed_targets:
                     if not conversation:
                         continue
