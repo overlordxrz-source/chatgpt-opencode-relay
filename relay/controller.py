@@ -36,6 +36,8 @@ class RelayConfig:
     max_reply_chars: int = 6000
     agent_timeout_ms: int = 180_000
     max_loop_repeats: int = 3
+    restart_if_wedged: bool = True
+    wedge_seconds: float = 300.0
     lookback_messages: int = 8
     repeat_window_seconds: float = 300.0
     duplicate_window_seconds: float = 120.0
@@ -79,6 +81,8 @@ class RelayConfig:
             max_reply_chars=int(limits.get("max_reply_chars", 6000)),
             agent_timeout_ms=int(limits.get("agent_timeout_ms", 180_000)),
             max_loop_repeats=int(limits.get("max_loop_repeats", 3)),
+            restart_if_wedged=bool(limits.get("restart_if_wedged", True)),
+            wedge_seconds=float(limits.get("wedge_seconds", 300)),
             lookback_messages=int(limits.get("lookback_messages", 8)),
             repeat_window_seconds=float(limits.get("repeat_window_seconds", 300)),
             duplicate_window_seconds=float(limits.get("duplicate_window_seconds", 120)),
@@ -143,6 +147,8 @@ class RelayController:
         # workers can never answer the same request with the same message.
         self._claimed: set[str] = set()
         self._claim_lock = threading.Lock()
+        self._unreadable_since: Optional[float] = None
+        self._last_restart: Optional[float] = None
         self._last_visit: dict[str, float] = {}
         self._pending_text: Optional[str] = None
         self._pending_hits = 0
@@ -690,6 +696,7 @@ class RelayController:
             if self.status.conversation_connected:
                 self.log(f"relay: {conversation!r} is not readable right now (idling)")
             self.status.conversation_connected = False
+            self.watchdog(self.config.wedge_seconds)
             return
         if not self.status.conversation_connected:
             self.log(f"relay: {conversation!r} is readable again")

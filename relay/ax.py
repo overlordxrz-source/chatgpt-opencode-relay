@@ -194,6 +194,50 @@ class ChatGPTApp:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def screen_locked() -> bool:
+        """True when the screen is locked (the app cannot render)."""
+        try:
+            session = Quartz.CGSessionCopyCurrentDictionary()
+            return bool(session and session.get("CGSSessionScreenIsLocked"))
+        except Exception:
+            return False
+
+    def cpu_percent(self) -> float:
+        """CPU usage of the app, in percent."""
+        try:
+            if self._pid is None:
+                self._resolve()
+            for process in NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+                self.bundle_ids[0]
+            ):
+                if int(process.processIdentifier()) == self._pid:
+                    return float(process.cpuUsage())
+        except Exception:
+            pass
+        return 0.0
+
+    def restart(self) -> bool:
+        """Quit and reopen the app (used only by the wedged-app watchdog)."""
+        try:
+            for process in NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+                self.bundle_ids[0]
+            ):
+                process.terminate()
+            time.sleep(4)
+            for process in NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+                self.bundle_ids[0]
+            ):
+                process.terminate()
+            time.sleep(2)
+            import subprocess
+
+            subprocess.run(["open", "-a", "ChatGPT"], check=False)
+            time.sleep(6)
+            return True
+        except Exception:
+            return False
+
     def visible_window_title(self) -> str:
         """Title of the frontmost on-screen window of this app."""
         pid = self._pid
