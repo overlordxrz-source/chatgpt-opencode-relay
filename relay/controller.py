@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import threading
+import urllib.request
+from pathlib import Path
 import re
 import time
 from dataclasses import dataclass, field
@@ -22,6 +26,8 @@ class RelayConfig:
     bridge_url: str
     bridge_env: str
     default_session: str = ""
+    target_session: str = ""
+    opencode_service_config: str = ""
     allowed_sessions: list[str] = field(default_factory=list)
     poll_seconds: float = 3.0
     strict_protocol: bool = True
@@ -62,6 +68,10 @@ class RelayConfig:
             bridge_url=opencode.get("bridge_url", "http://127.0.0.1:8787/mcp"),
             bridge_env=opencode.get("bridge_env", ""),
             default_session=opencode.get("default_session", ""),
+            target_session=opencode.get("target_session", ""),
+            opencode_service_config=opencode.get(
+                "opencode_service_config", ""
+            ),
             allowed_sessions=list(opencode.get("allowed_sessions", []) or []),
             strict_protocol=bool(limits.get("strict_protocol", True)),
             max_exchanges_per_hour=int(limits.get("max_exchanges_per_hour", 60)),
@@ -251,21 +261,46 @@ class RelayController:
         """The allowed session that is currently running an agent turn.
 
         This is the conversation the user is talking to right now, so a
-        request from ChatGPT lands in the agent they are actually using.
+        request from ChatGPT lands in the agent they are actually using. The
+        running state lives in the opencode background service (the process
+        that owns the TUI session), so that is where it is read from.
         """
+        running = self._running_sessions()
         for session in self.allowed_session_list():
             session_id = str(session.get("opencodeSessionId", ""))
-            if not session_id:
-                continue
-            try:
-                attached = self.opencode.attach(session_id)
-                bridge_session_id = attached["bridgeSession"]["bridgeSessionId"]
-                status = self.opencode.status(bridge_session_id)
-            except Exception:
-                continue
-            if status.get("status", {}).get("running"):
+            if session_id and session_id in running:
                 return session_id
         return None
+
+    def _running_sessions(self) -> set[str]:
+        """Session ids that the opencode background service reports as running."""
+        service_file = Path(
+            self.config.opencode_service_config
+            or (Path.home() / ".local/state/opencode/service.json")
+        ).expanduser()
+        if not service_file.exists():
+            return set()
+        try:
+            service = json.loads(service_file.read_text())
+            url = service.get("url")
+            password = service.get("password")
+            if not url or not password:
+                return set()
+            token = base64.b64encode(f"opencode:{password}".encode()).decode()
+            request = urllib.request.Request(
+                f"{url}/api/session/active",
+                headers={"Authorization": f"Basic {token}"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read())
+        except Exception:
+            return set()
+        active = (payload or {}).get("data") or {}
+        return {
+            str(session_id)
+            for session_id, state in active.items()
+            if isinstance(state, dict) and state.get("type") == "running"
+        }
 
     def _allowed(self) -> list[str]:
         allowed = list(self.config.allowed_sessions or [])
@@ -291,7 +326,29 @@ class RelayController:
         return [s for s in sessions if self._is_allowed(str(s.get("opencodeSessionId", "")), str(s.get("title", "")))]
 
     def _resolve_session(self, wanted: str) -> tuple[Optional[str], str, list[dict]]:
-        """Return (opencode session id, label, candidates)."""
+        """Return (opencode session id, label, candidates).
+
+        `target_session` is the explicit override: the session the relay always
+        delivers to (the live agent the user is talking to).
+        """
+        target = self.config.target_session
+        if target:
+            sessions = self.opencode.list_sessions(limit=100)
+            match = next(
+                (
+                    item
+                    for item in sessions
+                    if str(item.get("opencodeSessionId", "")).startswith(target)
+                    or target.lower() in str(item.get("title", "")).lower()
+                ),
+                None,
+            )
+            if match:
+                return (
+                    match.get("opencodeSessionId"),
+                    str(match.get("title", "")),
+                    sessions,
+                )
         wanted = (wanted or self.config.default_session or "").strip()
         sessions = self.opencode.list_sessions(limit=50)
         if not wanted:

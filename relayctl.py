@@ -196,8 +196,23 @@ def cmd_run(args) -> int:
                         f"relay: seeded {conversation!r} with {len(messages)} messages"
                         + (" (1 pending command kept)" if pending else "")
                     )
+                    if pending is not None and not seeded:
+                        # Run the waiting command right away: it may already be
+                        # outside the lookback window by the next cycle.
+                        commands = protocol.extract_commands(
+                            pending.text, relay_config.strict_protocol
+                        )
+                        if commands:
+                            log(f"relay: running the pending command from {conversation!r}")
+                            try:
+                                controller.handle_command(commands[0])
+                            except Exception as error:  # noqa: BLE001
+                                log(f"relay: could not run the pending command: {error}")
                 seeded = True
-                if relay_config.post_init_prompt and seed_targets:
+                already_instructed = any(
+                    "[OPENCODE_RELAY]" in (m.text or "") for m in (messages or [])
+                )
+                if relay_config.post_init_prompt and seed_targets and not already_instructed:
                     try:
                         allowed = controller.allowed_session_list()
                     except Exception as error:  # noqa: BLE001

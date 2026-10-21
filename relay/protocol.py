@@ -182,6 +182,9 @@ message: <the instruction for the agent>
 Rules:
 - Output only the block. No preamble, no explanation, no code fences.
 - `session` is the name of one of the sessions you were told about, or the id.
+- The relay always delivers your request to the user's live agent session, so
+  the [OPENCODE_REPLY] block may name a different session than you asked for.
+  That is expected - report the answer, not the session name.
 - The agent's answer comes back as an [OPENCODE_REPLY] block; read it and
   summarise it for the user.
 - If the agent reports a permission request, ask the user before approving it.
