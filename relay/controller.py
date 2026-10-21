@@ -39,6 +39,7 @@ class RelayConfig:
     switch_policy: str = "idle"
     idle_seconds: float = 120.0
     rotation_seconds: float = 45.0
+    route_to: str = "live"
 
     @classmethod
     def from_dict(cls, data: dict) -> "RelayConfig":
@@ -54,6 +55,7 @@ class RelayConfig:
             switch_policy=chatgpt.get("switch_policy", "idle"),
             idle_seconds=float(chatgpt.get("idle_seconds", 120)),
             rotation_seconds=float(chatgpt.get("rotation_seconds", 45)),
+            route_to=opencode.get("route_to", "live"),
             conversation_index=int(chatgpt.get("conversation_index", 0)),
             poll_seconds=float(chatgpt.get("poll_seconds", 3.0)),
             bridge_url=opencode.get("bridge_url", "http://127.0.0.1:8787/mcp"),
@@ -242,6 +244,26 @@ class RelayController:
         history.append(now)
         return True, ""
 
+    def _live_session(self) -> Optional[str]:
+        """The allowed session that is currently running an agent turn.
+
+        This is the conversation the user is talking to right now, so a
+        request from ChatGPT lands in the agent they are actually using.
+        """
+        for session in self.allowed_session_list():
+            session_id = str(session.get("opencodeSessionId", ""))
+            if not session_id:
+                continue
+            try:
+                attached = self.opencode.attach(session_id)
+                bridge_session_id = attached["bridgeSession"]["bridgeSessionId"]
+                status = self.opencode.status(bridge_session_id)
+            except Exception:
+                continue
+            if status.get("status", {}).get("running"):
+                return session_id
+        return None
+
     def _allowed(self) -> list[str]:
         allowed = list(self.config.allowed_sessions or [])
         if not allowed and self.config.default_session:
@@ -327,7 +349,12 @@ class RelayController:
             self._post(protocol.format_reply(command.session or "default", "refused", reason))
             return
 
-        session_id, label, sessions = self._resolve_session(command.session)
+        wanted = command.session
+        if self.config.route_to == "live":
+            live = self._live_session()
+            if live:
+                wanted = live
+        session_id, label, sessions = self._resolve_session(wanted)
         if session_id and not self._is_allowed(session_id, label):
             allowed = ", ".join(self._allowed()) or "(none configured)"
             body = (
@@ -355,6 +382,10 @@ class RelayController:
             return
 
         self.status.pending_task = command.message[:120]
+        self.log(
+            f"relay: delivering to session {label!r} ({session_id}) "
+            f"(requested {command.session or 'default'!r})"
+        )
         started = time.time()
         try:
             attached = self.opencode.attach(session_id)
@@ -467,14 +498,10 @@ class RelayController:
         # Identify the conversation by content: ChatGPT renames conversations,
         # so the title alone is not a stable identifier.
         fingerprint = self.chatgpt.fingerprint(messages)
-        stored = state.get("fingerprint")
-        if stored and stored != fingerprint:
-            # The user moved to a different conversation; that is fine, the
-            # relay simply follows whatever is in front.
-            self.status.conversation_connected = False
-            return
-        if stored != fingerprint:
-            state["fingerprint"] = fingerprint
+        # The fingerprint is over the last messages, so it changes whenever the
+        # conversation grows. It is only used to recognise a renamed
+        # conversation - it must never stop the relay from working.
+        state["fingerprint"] = fingerprint
         self.status.conversation_connected = True
 
         title = self.chatgpt.current_title()

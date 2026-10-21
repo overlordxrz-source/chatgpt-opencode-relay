@@ -135,6 +135,16 @@ def cmd_run(args) -> int:
 
     stopping = {"flag": False}
 
+    # Keep the Mac awake while the relay runs: the ChatGPT app has to be
+    # rendering for the accessibility tree to update. It is a child of the
+    # relay, so it dies with it. RELAY_NO_CAFFEINATE=1 turns it off.
+    caffeinate = None
+    if not os.environ.get("RELAY_NO_CAFFEINATE") and shutil.which("caffeinate"):
+        caffeinate = subprocess.Popen(
+            ["caffeinate", "-i"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        log(f"relay: holding the idle assertion (caffeinate pid {caffeinate.pid})")
+
     def handle_signal(signum, _frame):
         stopping["flag"] = True
 
@@ -217,6 +227,8 @@ def cmd_run(args) -> int:
         time.sleep(relay_config.poll_seconds)
 
     log("relay: stopped")
+    if caffeinate is not None:
+        caffeinate.terminate()
     controller.status.running = False
     status_mod.write_status(
         status_path,
@@ -255,12 +267,12 @@ def cmd_start(args) -> int:
     python = str(BASE_DIR / ".venv" / "bin" / "python")
     if not os.path.exists(python):
         python = sys.executable
+    # Make sure no older relay is still around.
+    subprocess.run(["pkill", "-f", "relayctl.py run"], check=False)
+    subprocess.run(["pkill", "-f", "caffeinate -i"], check=False)
+    time.sleep(0.5)
+
     command = [python, str(BASE_DIR / "relayctl.py"), "run"]
-    # Keep the Mac awake while the relay runs: the ChatGPT app has to be
-    # rendering for the accessibility tree to update. Set RELAY_NO_CAFFEINATE=1
-    # to disable this.
-    if not os.environ.get("RELAY_NO_CAFFEINATE") and shutil.which("caffeinate"):
-        command = ["caffeinate", "-i", "-w", str(os.getpid())] + command
     with open(log_file, "a") as handle:
         process = subprocess.Popen(
             command,
