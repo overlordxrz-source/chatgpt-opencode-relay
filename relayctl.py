@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -230,9 +231,15 @@ def cmd_start(args) -> int:
     python = str(BASE_DIR / ".venv" / "bin" / "python")
     if not os.path.exists(python):
         python = sys.executable
+    command = [python, str(BASE_DIR / "relayctl.py"), "run"]
+    # Keep the Mac awake while the relay runs: the ChatGPT app has to be
+    # rendering for the accessibility tree to update. Set RELAY_NO_CAFFEINATE=1
+    # to disable this.
+    if not os.environ.get("RELAY_NO_CAFFEINATE") and shutil.which("caffeinate"):
+        command = ["caffeinate", "-i", "-w", str(os.getpid())] + command
     with open(log_file, "a") as handle:
         process = subprocess.Popen(
-            [python, str(BASE_DIR / "relayctl.py"), "run"],
+            command,
             stdout=handle,
             stderr=subprocess.STDOUT,
             env=env,
