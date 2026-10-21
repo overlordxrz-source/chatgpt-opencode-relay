@@ -211,6 +211,8 @@ def cmd_run(args) -> int:
                 seeded = True
                 already_instructed = any(
                     "[OPENCODE_RELAY]" in (m.text or "") for m in (messages or [])
+                ) or any(
+                    store.get(f"init_prompted:{conversation}") for conversation in seed_targets
                 )
                 if relay_config.post_init_prompt and seed_targets and not already_instructed:
                     try:
@@ -220,7 +222,8 @@ def cmd_run(args) -> int:
                         allowed = []
                     log(f"relay: posting the initialisation prompt ({len(allowed)} allowed session(s))")
                     chatgpt.conversation = seed_targets[0]
-                    chatgpt.send(protocol.build_init_prompt(allowed))
+                    if chatgpt.send(protocol.build_init_prompt(allowed)):
+                        store.set(f"init_prompted:{seed_targets[0]}", "1")
 
             paused = pause_file.exists()
             controller.status.paused = paused
