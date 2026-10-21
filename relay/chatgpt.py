@@ -399,6 +399,13 @@ class ChatGPTAdapter:
         # are watching, otherwise the reply would land in another chat.
         if self._reply_landed(text):
             return True
+        # The button press can be swallowed (stale element, focus lost): try
+        # the keyboard path before giving up.
+        self.log("chatgpt: send button did not submit, trying Return")
+        self.app.press_return()
+        time.sleep(0.8)
+        if self._reply_landed(text):
+            return True
         self.log("chatgpt: the message did not appear in the conversation")
         return False
 
